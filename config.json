@@ -1,0 +1,18 @@
+{
+  "model_alias": {
+    "claude-haiku-4-5-20251001": "deepseek-v4-flash-free",
+    "claude-opus-4-7": "deepseek-v4-flash-free",
+    "claude-sonnet-4-6": "deepseek-v4-flash-free"
+  },
+  "reasoning_effort_map": {
+    "low": "high",
+    "medium": "high",
+    "xhigh": "max"
+  },
+  "force_disable_thinking": false,
+  "multimodal_upstream": {
+    "base_url": "https://integrate.api.nvidia.com/v1",
+    "api_key": "nvapi-ZmQiKrQHeCaHTTS5OR0XqhA14or8NLJKMpQk67s3JjYXADRH8foYc",
+    "model": "qwen/qwen3.5-397b-a17b"
+  }
+}
