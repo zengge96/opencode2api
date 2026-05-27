@@ -37,12 +37,6 @@ type Socks5Proxy struct {
 	Name     string `json:"name,omitempty"`
 }
 
-type MultimodalUpstreamConfig struct {
-	BaseURL string `json:"base_url"`
-	APIKey  string `json:"api_key"`
-	Model   string `json:"model"`
-}
-
 func socks5Dial(proxy Socks5Proxy) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, target string) (net.Conn, error) {
 		conn, err := net.DialTimeout("tcp", proxy.Addr, 10*time.Second)
@@ -193,11 +187,6 @@ var socks5RRIndex uint32
 var (
 	socks5Client      *http.Client // 缓存的 SOCKS5 客户端
 	socks5ClientAddr  string       // 缓存对应的代理地址
-)
-
-var (
-	multimodalUpstream   *MultimodalUpstreamConfig
-	multimodalUpstreamMu sync.RWMutex
 )
 
 func getHTTPClient() *http.Client {
@@ -372,7 +361,7 @@ var (
 	port                 string
 	configPath           = "config.json"
 	modelAlias           = map[string]string{}
-	reasoningEffortMap   = map[string]string{}
+	reasoningEffortMap   = map[string]string{"low": "high", "medium": "high", "xhigh": "max"}
 	forceDisableThinking bool
 	debugMode            bool
 	configMu             sync.RWMutex
@@ -446,12 +435,11 @@ type ToolFunction struct {
 }
 
 type AppConfig struct {
-	ModelAlias           map[string]string          `json:"model_alias"`
-	ReasoningEffortMap   map[string]string          `json:"reasoning_effort_map"`
-	ForceDisableThinking bool                       `json:"force_disable_thinking"`
-	Socks5Proxies        []Socks5Proxy              `json:"socks5_proxies,omitempty"`
-	ActiveSocks5         string                     `json:"active_socks5,omitempty"`
-	MultimodalUpstream   *MultimodalUpstreamConfig  `json:"multimodal_upstream,omitempty"`
+	ModelAlias           map[string]string `json:"model_alias"`
+	ReasoningEffortMap   map[string]string `json:"reasoning_effort_map"`
+	ForceDisableThinking bool              `json:"force_disable_thinking"`
+	Socks5Proxies        []Socks5Proxy     `json:"socks5_proxies,omitempty"`
+	ActiveSocks5         string            `json:"active_socks5,omitempty"`
 }
 
 // ======================== Claude Messages API 类型 ========================
@@ -589,10 +577,6 @@ func applyConfig(cfg AppConfig) {
 		atomic.StoreUint32(&socks5RRIndex, 0)
 	}
 	socks5Mu.Unlock()
-
-	multimodalUpstreamMu.Lock()
-	multimodalUpstream = cfg.MultimodalUpstream
-	multimodalUpstreamMu.Unlock()
 }
 
 func resolveModel(model string) string {
@@ -620,16 +604,6 @@ func getReasoningEffortMap() map[string]string {
 		cp[k] = v
 	}
 	return cp
-}
-
-func getMultimodalUpstream() *MultimodalUpstreamConfig {
-	multimodalUpstreamMu.RLock()
-	defer multimodalUpstreamMu.RUnlock()
-	if multimodalUpstream == nil {
-		return nil
-	}
-	cp := *multimodalUpstream
-	return &cp
 }
 
 // ======================== Token 统计 ========================
@@ -725,63 +699,6 @@ func wantsReasoning(req *OpenAIRequest) bool {
 }
 
 // ======================== 消息处理 ========================
-
-// ======================== 多模态检测 ========================
-
-func hasOpenAIImageContent(messages []Message) bool {
-	for _, msg := range messages {
-		if content, ok := msg.Content.([]any); ok {
-			for _, part := range content {
-				if block, ok := part.(map[string]any); ok {
-					if block["type"] == "image_url" {
-						return true
-					}
-				}
-			}
-		}
-	}
-	return false
-}
-
-func hasClaudeImageContent(messages []ClaudeMessage) bool {
-	for _, msg := range messages {
-		if content, ok := msg.Content.([]any); ok {
-			for _, part := range content {
-				if block, ok := part.(map[string]any); ok {
-					if block["type"] == "image" {
-						return true
-					}
-				}
-			}
-		}
-	}
-	return false
-}
-
-func hasResponsesImageContent(input any) bool {
-	switch v := input.(type) {
-	case []any:
-		for _, item := range v {
-			if elem, ok := item.(map[string]any); ok {
-				itemType, _ := elem["type"].(string)
-				switch itemType {
-				case "message", "":
-					if content, ok := elem["content"].([]any); ok {
-						for _, c := range content {
-							if block, ok := c.(map[string]any); ok {
-								if block["type"] == "input_image" {
-									return true
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-	return false
-}
-
 
 func normalizeContent(content any) *string {
 	if content == nil {
@@ -1278,57 +1195,6 @@ func convertResponse(data []byte, keepReasoning bool) ([]byte, error) {
 	return json.Marshal(raw)
 }
 
-// ======================== 多模态上游转发 ========================
-
-func buildMultimodalRequest(body []byte) (*http.Request, error) {
-	upstream := getMultimodalUpstream()
-	if upstream == nil {
-		return nil, fmt.Errorf("multimodal upstream not configured")
-	}
-	req, err := http.NewRequest("POST", upstream.BaseURL+"/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+upstream.APIKey)
-	req.Header.Set("Accept", "application/json")
-	return req, nil
-}
-
-func callMultimodalUpstream(body []byte) ([]byte, int, http.Header, error) {
-	up, err := buildMultimodalRequest(body)
-	if err != nil {
-		return nil, 500, nil, err
-	}
-	resp, err := getHTTPClient().Do(up)
-	if err != nil {
-		return nil, 502, nil, fmt.Errorf("multimodal upstream connect failed: %w", err)
-	}
-	defer resp.Body.Close()
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, 0, nil, err
-	}
-	return b, resp.StatusCode, resp.Header, nil
-}
-
-func callMultimodalUpstreamStream(body []byte) (io.ReadCloser, int, http.Header, error) {
-	up, err := buildMultimodalRequest(body)
-	if err != nil {
-		return nil, 500, nil, err
-	}
-	resp, err := getHTTPClient().Do(up)
-	if err != nil {
-		return nil, 502, nil, fmt.Errorf("multimodal upstream connect failed: %w", err)
-	}
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return resp.Body, resp.StatusCode, resp.Header, nil
-	}
-	errBody, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	return nil, resp.StatusCode, resp.Header, fmt.Errorf("multimodal upstream error: %s", string(errBody))
-}
-
 // ======================== OpenCode 上游调用 ========================
 
 func buildOCRequest(modelID string, bodyMap map[string]any) (*http.Request, error) {
@@ -1505,28 +1371,6 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 			req.Model = "deepseek-v4-flash-free"
 		}
 	}
-
-	// 多模态路由：检测到图片时转发到配置的上游
-	if cfg := getMultimodalUpstream(); cfg != nil && hasOpenAIImageContent(req.Messages) {
-		if debugMode {
-			log.Printf("[request #%d] detected image, routing to multimodal upstream", cnt)
-		}
-		var fwdBody map[string]any
-		if err := json.Unmarshal(body, &fwdBody); err != nil {
-			http.Error(w, "Invalid JSON", http.StatusBadRequest)
-			return
-		}
-		fwdBody["model"] = cfg.Model
-		fwdBytes, _ := json.Marshal(fwdBody)
-
-		if req.Stream {
-			handleMultimodalStream(w, fwdBytes, cnt)
-		} else {
-			handleMultimodalNonStream(w, fwdBytes, cnt)
-		}
-		return
-	}
-
 	req.Messages = fixToolCallGaps(req.Messages)
 	keepReasoning := wantsReasoning(&req)
 	req.Messages = ensureReasoningContent(req.Messages, keepReasoning)
@@ -1636,131 +1480,6 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(outBody)
 }
 
-// ======================== 多模态流式/非流式处理 ========================
-
-func handleMultimodalNonStream(w http.ResponseWriter, fwdBody []byte, cnt int64) {
-	respBody, status, _, err := callMultimodalUpstream(fwdBody)
-	if err != nil || status < 200 || status >= 300 {
-		if debugMode {
-			log.Printf("[request #%d] multimodal upstream error: status=%d err=%v", cnt, status, err)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
-		json.NewEncoder(w).Encode(map[string]any{
-			"error": map[string]any{"message": "multimodal upstream error", "type": "upstream_error"},
-		})
-		return
-	}
-	var mmModel string
-	var mmResp map[string]any
-	if json.Unmarshal(respBody, &mmResp) == nil {
-		if m, ok := mmResp["model"].(string); ok {
-			mmModel = m
-		}
-	}
-	outBody := respBody
-	if cleaned, err := convertResponse(respBody, false); err == nil {
-		outBody = cleaned
-	}
-	// Record token usage
-	var usageResp map[string]any
-	if json.Unmarshal(respBody, &usageResp) == nil {
-		if u, ok := usageResp["usage"].(map[string]any); ok {
-			pt, _ := u["prompt_tokens"].(float64)
-			ct, _ := u["completion_tokens"].(float64)
-			tt, _ := u["total_tokens"].(float64)
-			if tt > 0 {
-				recordTokenUsage(mmModel, int64(pt), int64(ct), int64(tt))
-			}
-		}
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	w.Write(outBody)
-}
-
-func handleMultimodalStream(w http.ResponseWriter, fwdBody []byte, cnt int64) {
-	upResp, status, _, err := callMultimodalUpstreamStream(fwdBody)
-	if err != nil || status < 200 || status >= 300 {
-		if debugMode {
-			log.Printf("[request #%d] multimodal upstream stream error: status=%d err=%v", cnt, status, err)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
-		json.NewEncoder(w).Encode(map[string]any{
-			"error": map[string]any{"message": "multimodal upstream error", "type": "upstream_error"},
-		})
-		return
-	}
-	defer upResp.Close()
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
-	reader := bufio.NewReader(upResp)
-	doneSeen := false
-	mmModel := ""
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			log.Printf("Error reading multimodal stream: %v", err)
-			w.Write([]byte("data: {\"error\":\"stream read error\"}\n\n"))
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
-			}
-			return
-		}
-		if doneSeen {
-			continue
-		}
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "data: [DONE]" {
-			doneSeen = true
-			w.Write([]byte("data: [DONE]\n\n"))
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
-			}
-			continue
-		}
-		out, usage := convertStreamChunkWithUsage(line, false)
-		if mmModel == "" && strings.HasPrefix(line, "data: ") {
-			var raw map[string]any
-			if json.Unmarshal([]byte(line[6:]), &raw) == nil {
-				if m, ok := raw["model"].(string); ok {
-					mmModel = m
-				}
-			}
-		}
-		if out == "" {
-			if usage != nil {
-				pt, _ := usage["prompt_tokens"].(float64)
-				ct, _ := usage["completion_tokens"].(float64)
-				tt, _ := usage["total_tokens"].(float64)
-				if tt > 0 {
-					recordTokenUsage(mmModel, int64(pt), int64(ct), int64(tt))
-				}
-			}
-			continue
-		}
-		if usage != nil && !doneSeen {
-			pt, _ := usage["prompt_tokens"].(float64)
-			ct, _ := usage["completion_tokens"].(float64)
-			tt, _ := usage["total_tokens"].(float64)
-			if tt > 0 {
-				recordTokenUsage(mmModel, int64(pt), int64(ct), int64(tt))
-			}
-		}
-		w.Write([]byte(out))
-		w.Write([]byte("\n"))
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
-	}
-}
-
 // ======================== Models Handler ========================
 
 func listModelsHandler(w http.ResponseWriter, r *http.Request) {
@@ -1849,129 +1568,6 @@ func cleanJsonSchema(schema any) any {
 		}
 	}
 	return m
-}
-
-func claudeToMultimodalMessages(claudeMsgs []ClaudeMessage, system any) []Message {
-	var messages []Message
-	if sysText := extractClaudeSystemText(system); sysText != "" {
-		messages = append(messages, Message{Role: "system", Content: sysText})
-	}
-	for _, msg := range claudeMsgs {
-		if content, ok := msg.Content.([]any); ok {
-			parts := make([]map[string]any, 0, len(content))
-			var reasoningParts []string
-			var toolCalls []ToolCall
-			var toolResults []Message
-			for _, item := range content {
-				block, ok := item.(map[string]any)
-				if !ok {
-					continue
-				}
-				switch block["type"] {
-				case "text":
-					if text, ok := block["text"].(string); ok && text != "" {
-						parts = append(parts, map[string]any{"type": "text", "text": text})
-					}
-				case "image":
-					parts = append(parts, convertClaudeImageBlock(block))
-				case "thinking":
-					if thinking, ok := block["thinking"].(string); ok && thinking != "" {
-						reasoningParts = append(reasoningParts, thinking)
-					}
-				case "tool_use":
-					id, _ := block["id"].(string)
-					name, _ := block["name"].(string)
-					var args string
-					switch input := block["input"].(type) {
-					case string:
-						args = input
-					default:
-						if input != nil {
-							b, _ := json.Marshal(input)
-							args = string(b)
-						}
-					}
-					if args == "" {
-						args = "{}"
-					}
-					toolCalls = append(toolCalls, ToolCall{
-						ID: id, Type: "function",
-						Function: FunctionCall{Name: name, Arguments: args},
-					})
-				case "tool_result":
-					toolUseID, _ := block["tool_use_id"].(string)
-					var resultText string
-					switch c := block["content"].(type) {
-					case string:
-						resultText = c
-					case []any:
-						var texts []string
-						for _, p := range c {
-							if pb, ok := p.(map[string]any); ok && pb["type"] == "text" {
-								if t, ok := pb["text"].(string); ok {
-									texts = append(texts, t)
-								}
-							}
-						}
-						resultText = strings.Join(texts, "\n")
-					default:
-						if c != nil {
-							b, _ := json.Marshal(c)
-							resultText = string(b)
-						}
-					}
-					toolResults = append(toolResults, Message{Role: "tool", ToolCallID: toolUseID, Content: resultText})
-				}
-			}
-			om := Message{Role: msg.Role}
-			if len(parts) > 0 {
-				om.Content = parts
-			} else if len(toolCalls) > 0 {
-				om.Content = ""
-			}
-			if len(reasoningParts) > 0 {
-				rc := strings.Join(reasoningParts, "\n")
-				om.ReasoningContent = &rc
-			}
-			if len(toolCalls) > 0 {
-				om.ToolCalls = toolCalls
-			}
-			messages = append(messages, om)
-			messages = append(messages, toolResults...)
-		} else if s, ok := msg.Content.(string); ok {
-			messages = append(messages, Message{Role: msg.Role, Content: s})
-		}
-	}
-	return messages
-}
-
-func convertClaudeImageBlock(block map[string]any) map[string]any {
-	source, _ := block["source"].(map[string]any)
-	if source == nil {
-		return map[string]any{"type": "text", "text": ""}
-	}
-	srcType, _ := source["type"].(string)
-	switch srcType {
-	case "base64":
-		mediaType, _ := source["media_type"].(string)
-		data, _ := source["data"].(string)
-		return map[string]any{
-			"type": "image_url",
-			"image_url": map[string]any{
-				"url": "data:" + mediaType + ";base64," + data,
-			},
-		}
-	case "url":
-		url, _ := source["url"].(string)
-		return map[string]any{
-			"type": "image_url",
-			"image_url": map[string]any{
-				"url": url,
-			},
-		}
-	default:
-		return map[string]any{"type": "text", "text": ""}
-	}
 }
 
 func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
@@ -2219,70 +1815,6 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	claudeReq.Model = resolveModel(claudeReq.Model)
-
-	// 多模态路由
-	if cfg := getMultimodalUpstream(); cfg != nil && hasClaudeImageContent(claudeReq.Messages) {
-		if debugMode {
-			log.Printf("[request #%d] detected image in Claude request, routing to multimodal upstream", cnt)
-		}
-		mmMessages := claudeToMultimodalMessages(claudeReq.Messages, claudeReq.System)
-		mmChatReq := map[string]any{
-			"model":    cfg.Model,
-			"messages": mmMessages,
-			"stream":   claudeReq.Stream,
-			"max_tokens": 4096,
-		}
-		if claudeReq.MaxTokens > 0 {
-			mmChatReq["max_tokens"] = claudeReq.MaxTokens
-		}
-		fwdBody, _ := json.Marshal(mmChatReq)
-		wantReasoning := !getForceDisableThinking()
-		if claudeReq.Thinking != nil && isThinkingDisabled(claudeReq.Thinking) {
-			wantReasoning = false
-		}
-
-		if claudeReq.Stream {
-			upResp, status, _, err := callMultimodalUpstreamStream(fwdBody)
-			if err != nil || status < 200 || status >= 300 {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(status)
-				json.NewEncoder(w).Encode(map[string]any{
-					"type": "error",
-					"error": map[string]string{"type": "api_error", "message": "multimodal upstream error"},
-				})
-				return
-			}
-			defer upResp.Close()
-			claudeStreamHandler(w, upResp, claudeReq.Model, wantReasoning)
-		} else {
-			respBody, status, _, err := callMultimodalUpstream(fwdBody)
-			if err != nil || status < 200 || status >= 300 {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(status)
-				json.NewEncoder(w).Encode(map[string]any{
-					"type": "error",
-					"error": map[string]string{"type": "api_error", "message": "multimodal upstream error"},
-				})
-				return
-			}
-			claudeResp := openAIToClaudeResponse(respBody, claudeReq.Model, wantReasoning)
-			var usageResp map[string]any
-			if json.Unmarshal(respBody, &usageResp) == nil {
-				if u, ok := usageResp["usage"].(map[string]any); ok {
-					pt, _ := u["prompt_tokens"].(float64)
-					ct, _ := u["completion_tokens"].(float64)
-					tt, _ := u["total_tokens"].(float64)
-					if tt > 0 {
-						recordTokenUsage(claudeReq.Model, int64(pt), int64(ct), int64(tt))
-					}
-				}
-			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			w.Write(claudeResp)
-		}
-		return
-	}
 
 	messages := claudeToOpenAIMessages(claudeReq.Messages, claudeReq.System)
 	messages = fixToolCallGaps(messages)
@@ -2877,174 +2409,6 @@ func extractTextFromContentParts(content any) string {
 	return strings.Join(texts, "\n")
 }
 
-func responsesInputToMultimodalMessages(input any, instructions string) []Message {
-	var messages []Message
-	if instructions != "" {
-		messages = append(messages, Message{Role: "system", Content: instructions})
-	}
-	switch v := input.(type) {
-	case string:
-		messages = append(messages, Message{Role: "user", Content: v})
-	case []any:
-		functionOutputs := collectFunctionOutputs(v)
-		for _, item := range v {
-			switch elem := item.(type) {
-			case string:
-				messages = append(messages, Message{Role: "user", Content: elem})
-			case map[string]any:
-				itemType, _ := elem["type"].(string)
-				switch itemType {
-				case "function_call", "tool_call":
-					callID, _ := elem["call_id"].(string)
-					if callID == "" {
-						callID, _ = elem["id"].(string)
-					}
-					name, _ := elem["name"].(string)
-					args, _ := elem["arguments"].(string)
-					if name == "" {
-						if tu, ok := elem["tool_use"].(map[string]any); ok {
-							name, _ = tu["name"].(string)
-							callID, _ = tu["id"].(string)
-							if a, ok := tu["arguments"].(string); ok {
-								args = a
-							} else if inp, ok := tu["input"]; ok {
-								b, _ := json.Marshal(inp)
-								args = string(b)
-							}
-						}
-					}
-					if args == "" {
-						args = "{}"
-					}
-					messages = append(messages, Message{
-						Role: "assistant", Content: "",
-						ToolCalls: []ToolCall{{ID: callID, Type: "function",
-							Function: FunctionCall{Name: name, Arguments: args}}},
-					})
-					if callID != "" {
-						output := functionOutputs[callID]
-						if output == "" {
-							output = "[tool output missing]"
-						}
-						messages = append(messages, Message{Role: "tool", ToolCallID: callID, Content: output})
-					}
-				case "function_call_output", "tool_result":
-					callID, _ := elem["call_id"].(string)
-					if callID == "" {
-						callID, _ = elem["tool_use_id"].(string)
-					}
-					if callID != "" {
-						output := functionOutputs[callID]
-						if output == "" {
-							switch o := elem["output"].(type) {
-							case string:
-								output = o
-							default:
-								if o != nil {
-									b, _ := json.Marshal(o)
-									output = string(b)
-								}
-							}
-						}
-						if output == "" {
-							output = "[tool output missing]"
-						}
-						messages = append(messages, Message{Role: "tool", ToolCallID: callID, Content: output})
-					}
-					continue
-				case "reasoning":
-					if text := extractTextFromContentParts(elem["summary"]); text != "" {
-						messages = append(messages, Message{Role: "assistant", Content: "", ReasoningContent: &text})
-					}
-					continue
-				case "message", "":
-					role := "user"
-					if r, ok := elem["role"].(string); ok && r != "" {
-						role = r
-					}
-					if role == "developer" {
-						role = "system"
-					}
-					if content, ok := elem["content"].([]any); ok {
-						parts := make([]map[string]any, 0, len(content))
-						for _, c := range content {
-							if block, ok := c.(map[string]any); ok {
-								switch block["type"] {
-								case "input_text":
-									if t, ok := block["text"].(string); ok && t != "" {
-										parts = append(parts, map[string]any{"type": "text", "text": t})
-									}
-								case "input_image":
-									img := map[string]any{"type": "image_url", "image_url": map[string]any{}}
-									if url, ok := block["image_url"].(string); ok {
-										img["image_url"].(map[string]any)["url"] = url
-									} else if fileID, ok := block["file_id"].(string); ok {
-										img["image_url"].(map[string]any)["url"] = "data:image/*;base64," + fileID
-									}
-									if u, ok := img["image_url"].(map[string]any)["url"]; ok && u != "" {
-										parts = append(parts, img)
-									}
-								}
-							}
-						}
-						if len(parts) > 0 {
-							messages = append(messages, Message{Role: role, Content: parts})
-						}
-					} else if s, ok := elem["content"].(string); ok {
-						messages = append(messages, Message{Role: role, Content: s})
-					}
-				default:
-					role := "user"
-					if r, ok := elem["role"].(string); ok && r != "" {
-						role = r
-					}
-					if role == "developer" {
-						role = "system"
-					}
-					if content, ok := elem["content"].([]any); ok {
-						parts := make([]map[string]any, 0, len(content))
-						for _, c := range content {
-							if block, ok := c.(map[string]any); ok {
-								switch block["type"] {
-								case "input_text":
-									if t, ok := block["text"].(string); ok && t != "" {
-										parts = append(parts, map[string]any{"type": "text", "text": t})
-									}
-								case "input_image":
-									img := map[string]any{"type": "image_url", "image_url": map[string]any{}}
-									if url, ok := block["image_url"].(string); ok {
-										img["image_url"].(map[string]any)["url"] = url
-									} else if fileID, ok := block["file_id"].(string); ok {
-										img["image_url"].(map[string]any)["url"] = "data:image/*;base64," + fileID
-									}
-									if u, ok := img["image_url"].(map[string]any)["url"]; ok && u != "" {
-										parts = append(parts, img)
-									}
-								}
-							}
-						}
-						if len(parts) > 0 {
-							messages = append(messages, Message{Role: role, Content: parts})
-						}
-					} else if s, ok := elem["content"].(string); ok {
-						messages = append(messages, Message{Role: role, Content: s})
-					} else {
-						b, _ := json.Marshal(elem)
-						messages = append(messages, Message{Role: role, Content: string(b)})
-					}
-				}
-			default:
-				b, _ := json.Marshal(elem)
-				messages = append(messages, Message{Role: "user", Content: string(b)})
-			}
-		}
-	default:
-		b, _ := json.Marshal(v)
-		messages = append(messages, Message{Role: "user", Content: string(b)})
-	}
-	return messages
-}
-
 func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -3076,71 +2440,6 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		} else {
 			respReq.Model = "deepseek-v4-flash-free"
 		}
-	}
-
-	// 多模态路由
-	if cfg := getMultimodalUpstream(); cfg != nil && len(respReq.Messages) == 0 && respReq.Input != nil && hasResponsesImageContent(respReq.Input) {
-		if debugMode {
-			log.Printf("[request #%d] detected image in Responses request, routing to multimodal upstream", cnt)
-		}
-		mmMessages := responsesInputToMultimodalMessages(respReq.Input, respReq.Instructions)
-		mmBody := map[string]any{
-			"model":    cfg.Model,
-			"messages": mmMessages,
-			"stream":   respReq.Stream,
-			"max_tokens": 4096,
-		}
-		if respReq.MaxTokens != 0 {
-			mmBody["max_tokens"] = respReq.MaxTokens
-		}
-		if respReq.Temperature != 0 {
-			mmBody["temperature"] = respReq.Temperature
-		}
-		fwdBody, _ := json.Marshal(mmBody)
-
-		if respReq.Stream {
-			upResp, status, _, err := callMultimodalUpstreamStream(fwdBody)
-			if err != nil || status < 200 || status >= 300 {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(status)
-				json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "multimodal upstream error"}})
-				return
-			}
-			defer upResp.Close()
-			resp := &http.Response{
-				StatusCode: status,
-				Body:       upResp,
-				Header:     make(http.Header),
-			}
-			wantReasoning := !getForceDisableThinking()
-			responsesStreamHandler(w, r, resp, respReq.Model, respReq.Model, wantReasoning, nil, nil)
-		} else {
-			respBody, status, _, err := callMultimodalUpstream(fwdBody)
-			if err != nil || status < 200 || status >= 300 {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(status)
-				json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "multimodal upstream error"}})
-				return
-			}
-			wantReasoning := !getForceDisableThinking()
-			respModel := respReq.Model
-			responsesBody := convertChatToResponses(respBody, respModel, wantReasoning, nil, nil)
-			var usageResp map[string]any
-			if json.Unmarshal(respBody, &usageResp) == nil {
-				if u, ok := usageResp["usage"].(map[string]any); ok {
-					pt, _ := u["prompt_tokens"].(float64)
-					ct, _ := u["completion_tokens"].(float64)
-					tt, _ := u["total_tokens"].(float64)
-					if tt > 0 {
-						recordTokenUsage(respModel, int64(pt), int64(ct), int64(tt))
-					}
-				}
-			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			w.Write(responsesBody)
-		}
-		return
 	}
 
 	messages := respReq.Messages
@@ -3868,9 +3167,6 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 		cfg.Socks5Proxies = socks5Proxies
 		cfg.ActiveSocks5 = activeSocks5
 		socks5Mu.RUnlock()
-		multimodalUpstreamMu.RLock()
-		cfg.MultimodalUpstream = multimodalUpstream
-		multimodalUpstreamMu.RUnlock()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(cfg)
 	case http.MethodPost:
@@ -3892,44 +3188,6 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
-}
-
-func adminMMModelsHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	cfg := getMultimodalUpstream()
-	baseURL := ""
-	apiKey := ""
-	if cfg != nil && cfg.BaseURL != "" {
-		baseURL = cfg.BaseURL
-		apiKey = cfg.APIKey
-	}
-	// 支持通过查询参数传入（用户未保存时也可获取模型列表）
-	if u := r.URL.Query().Get("url"); u != "" {
-		baseURL = u
-	}
-	if k := r.URL.Query().Get("key"); k != "" {
-		apiKey = k
-	}
-	if baseURL == "" {
-		http.Error(w, `{"error":"multimodal upstream not configured"}`, http.StatusBadRequest)
-		return
-	}
-	req, _ := http.NewRequest("GET", strings.TrimRight(baseURL, "/")+"/models", nil)
-	if apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-	}
-	resp, err := getHTTPClient().Do(req)
-	if err != nil {
-		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	w.Header().Set("Content-Type", "application/json")
-	w.Write(body)
 }
 
 func adminStatsHandler(w http.ResponseWriter, r *http.Request) {
@@ -3970,9 +3228,7 @@ const adminHTML = `<!DOCTYPE html>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f5f5f5;color:#333;line-height:1.6}
-.container{max-width:960px;margin:0 auto;padding:24px 16px}
-.config-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}
-.config-grid .card:last-child{grid-column:1/-1}
+.container{max-width:900px;margin:0 auto;padding:24px 16px}
 h1{font-size:22px;font-weight:600;margin-bottom:4px}
 .subtitle{color:#666;font-size:13px;margin-bottom:28px}
 .card{background:#fff;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,.08);padding:24px;margin-bottom:20px}
@@ -4012,18 +3268,15 @@ h1{font-size:22px;font-weight:600;margin-bottom:4px}
 <body>
 <div class="container">
 <h1>OC2API 管理面板</h1>
-<p class="subtitle">OpenCode 模型 -> OpenAI API 代理
-<button class="btn btn-default" onclick="reloadConfig()" style="font-size:12px;padding:2px 10px;margin-left:8px;vertical-align:middle">重新加载</button>
-</p>
+<p class="subtitle">OpenCode 模型 -> OpenAI API 代理</p>
 
 <div class="card">
-<h2>Token 统计</h2>
+<h2>Token 统计 <button class="btn btn-default" onclick="loadStats()" style="font-size:12px;padding:2px 10px;margin-left:8px;vertical-align:middle">刷新</button></h2>
 <div id="statsContent" style="font-size:13px;margin-bottom:10px">
 <div class="empty-hint">加载中...</div>
 </div>
 <div style="display:flex;gap:8px;align-items:center"><button class="btn btn-warning" onclick="resetStats()">清空统计</button><span id="resetStatus" style="font-size:12px;color:#999"></span></div>
 </div>
-<div class="config-grid">
 <div class="card">
 <h2>基本配置</h2>
 <div class="form-group">
@@ -4035,6 +3288,7 @@ h1{font-size:22px;font-weight:600;margin-bottom:4px}
 </div>
 <div class="actions">
 <button class="btn btn-success" onclick="saveConfig()">保存配置</button>
+<button class="btn btn-default" onclick="loadConfig()">重新加载</button>
 </div>
 </div>
 <div class="card">
@@ -4064,34 +3318,6 @@ h1{font-size:22px;font-weight:600;margin-bottom:4px}
 </div>
 </div>
 <div class="card">
-<h2>多模态上游</h2>
-<div class="form-group">
-<label>上游地址（Base URL）</label>
-<input type="url" id="mm_url" placeholder="例如: https://api.openai.com/v1">
-<div class="hint">程序自动拼接 /chat/completions</div>
-</div>
-<div class="form-group">
-<label>API 密钥</label>
-<input type="password" id="mm_api_key" placeholder="Bearer Token 的值">
-<div class="hint">仅输入密钥本身，无需 Bearer 前缀</div>
-</div>
-<div class="form-group">
-<label>模型名</label>
-<input type="text" id="mm_model" placeholder="例如: gpt-4o" style="width:100%;margin-bottom:6px">
-<div style="display:flex;gap:8px">
-<select id="mmModelSelect" class="m-select" style="flex:1" onchange="if(this.value){document.getElementById('mm_model').value=this.value}">
-<option value="">-- 选择模型或手动输入 --</option>
-</select>
-<button class="btn btn-default" onclick="fetchMMModels()" style="white-space:nowrap;padding:6px 12px">获取模型列表</button>
-</div>
-<div class="hint">可直接输入模型名，或点击按钮从上游 /v1/models 获取列表选择</div>
-</div>
-<div class="actions">
-<button class="btn btn-success" onclick="saveConfig()">保存配置</button>
-<button class="btn btn-default" onclick="document.getElementById('mm_url').value='';document.getElementById('mm_api_key').value='';document.getElementById('mm_model').value=''">清空</button>
-</div>
-</div>
-<div class="card">
 <h2>SOCKS5 代理</h2>
 <div style="margin-bottom:14px">
 <table class="alias-table" id="socks5Table">
@@ -4111,12 +3337,10 @@ h1{font-size:22px;font-weight:600;margin-bottom:4px}
 </div>
 </div>
 </div>
-</div>
 <div id="toast"></div>
 <script>
 	let aliasData={},effortData={},modelList=[],socks5Data=[];
-	async function loadConfig(){const sy=window.scrollY;try{const r=await fetch('/api/config');const cfg=await r.json();document.getElementById('force_disable_thinking').checked=cfg.force_disable_thinking||false;aliasData=cfg.model_alias||{};effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];const mm=cfg.multimodal_upstream;document.getElementById('mm_url').value=mm&&mm.base_url?mm.base_url:'';document.getElementById('mm_api_key').value=mm&&mm.api_key?mm.api_key:'';document.getElementById('mm_model').value=mm&&mm.model?mm.model:'';const mr=await fetch('/v1/models');const md=await mr.json();modelList=(md.data||[]).map(m=>m.id);renderAliasTable();renderEffortTable();renderSocks5Table();document.getElementById('activeSocks5').value=cfg.active_socks5||'';setTimeout(()=>window.scrollTo(0,sy),0)}catch(e){showToast('失败: '+e.message,'error')}}
-function reloadConfig(){const sy=window.scrollY;loadConfig();setTimeout(()=>window.scrollTo(0,sy),100)}
+	async function loadConfig(){try{const r=await fetch('/admin/api/config');const cfg=await r.json();document.getElementById('force_disable_thinking').checked=cfg.force_disable_thinking||false;aliasData=cfg.model_alias||{};effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];const mr=await fetch('/v1/models');const md=await mr.json();modelList=(md.data||[]).map(m=>m.id);renderAliasTable();renderEffortTable();renderSocks5Table();document.getElementById('activeSocks5').value=cfg.active_socks5||''}catch(e){showToast('失败: '+e.message,'error')}}
 	function renderAliasTable(){const tb=document.querySelector('#aliasTable tbody');const ks=Object.keys(aliasData);if(!ks.length){tb.innerHTML='<tr><td colspan="3" class="empty-hint">暂无别名配置</td></tr>';return}tb.innerHTML=ks.map(k=>'<tr><td><input value="'+esc(k)+'" data-field="key"></td><td>'+modelSelectHtml(aliasData[k])+'</td><td><button class="btn btn-warning" onclick="delAlias(this)">删除</button></td></tr>').join('')}
 	function modelSelectHtml(selected){let h='<select data-field="val" class="m-select">';h+='<option value="">-- 选择模型 --</option>';for(const m of modelList){h+='<option value="'+esc(m)+'"'+(selected===m?' selected':'')+'>'+esc(m)+'</option>'}h+='</select>';return h}
 	function addAliasRow(){const tb=document.querySelector('#aliasTable tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';tb.insertAdjacentHTML('beforeend','<tr><td><input value="" placeholder="例如: gpt-5.5" data-field="key"></td><td>'+modelSelectHtml('')+'</td><td><button class="btn btn-warning" onclick="delAlias(this)">删除</button></td></tr>')}
@@ -4131,14 +3355,12 @@ function addSocks5Row(){const tb=document.querySelector('#socks5Table tbody');if
 function delSocks5(i){socks5Data.splice(i,1);renderSocks5Table()}
 function collectSocks5(){const r=[];document.querySelectorAll('#socks5Table tbody tr').forEach(tr=>{const a=tr.querySelector('[data-field="addr"]');if(a&&a.value.trim())r.push({addr:a.value.trim(),name:(tr.querySelector('[data-field="name"]')||{}).value?.trim()||'',username:(tr.querySelector('[data-field="username"]')||{}).value?.trim()||'',password:(tr.querySelector('[data-field="password"]')||{}).value?.trim()||''})});socks5Data=r;return r}
 function renderSocks5Select(){const sel=document.getElementById('activeSocks5');const cur=sel.value;sel.innerHTML='<option value="">直连（不使用代理）</option>';socks5Data.forEach(p=>{if(p.addr){const label=p.name?p.name+' ('+p.addr+')':p.addr;const opt=document.createElement('option');opt.value=p.addr;opt.textContent=label;sel.appendChild(opt)}});if(socks5Data.length>=2){const opt=document.createElement('option');opt.value='__round_robin__';opt.textContent='轮询（自动切换）';sel.appendChild(opt)}sel.value=cur;if(!sel.value)sel.value='';}
-async function saveConfig(){collectAliases();collectEfforts();collectSocks5();const mmUrl=document.getElementById('mm_url').value.trim();const mmKey=document.getElementById('mm_api_key').value.trim();const mmModel=document.getElementById('mm_model').value.trim();const cfg={model_alias:aliasData,reasoning_effort_map:effortData,force_disable_thinking:document.getElementById('force_disable_thinking').checked,socks5_proxies:socks5Data,active_socks5:document.getElementById('activeSocks5').value};if(mmUrl){cfg.multimodal_upstream={base_url:mmUrl,api_key:mmKey};if(mmModel)cfg.multimodal_upstream.model=mmModel}try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast('配置已保存','success');loadConfig()}catch(e){showToast('保存失败: '+e.message,'error')}}
-async function fetchMMModels(){const u=document.getElementById('mm_url').value.trim();const k=document.getElementById('mm_api_key').value.trim();let path='/api/mm_models';if(u)path+='?url='+encodeURIComponent(u)+'&key='+encodeURIComponent(k);try{const r=await fetch(path);if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json();const ids=(d.data||[]).map(m=>m.id);const sel=document.getElementById('mmModelSelect');const cur=document.getElementById('mm_model').value;sel.innerHTML='<option value="">-- 选择模型或手动输入 --</option>'+ids.map(m=>'<option value="'+esc(m)+'">'+esc(m)+'</option>').join('');if(cur)sel.value=cur;showToast('获取到 '+ids.length+' 个模型','success')}catch(e){showToast('获取失败: '+e.message,'error')}}
+async function saveConfig(){collectAliases();collectEfforts();collectSocks5();const cfg={model_alias:aliasData,reasoning_effort_map:effortData,force_disable_thinking:document.getElementById('force_disable_thinking').checked,socks5_proxies:socks5Data,active_socks5:document.getElementById('activeSocks5').value};try{const r=await fetch('/admin/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast('配置已保存','success');renderSocks5Select()}catch(e){showToast('保存失败: '+e.message,'error')}}
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
 function showToast(msg,t){const e=document.getElementById('toast');e.textContent=msg;e.className=t+' show';clearTimeout(e._tid);e._tid=setTimeout(()=>e.classList.remove('show'),2500)}
 
-async function resetStats(){if(!confirm('确认清空所有 Token 统计？\n此操作不可撤销。'))return;const s=document.getElementById('resetStatus');s.textContent='清空中...';try{const r=await fetch('/api/stats',{method:'DELETE'});if(!r.ok)throw new Error(await r.text());document.getElementById('statsContent').innerHTML='<div class="empty-hint">暂无数据</div>';s.textContent='已清空';setTimeout(()=>s.textContent='',2000)}catch(e){s.textContent='失败: '+e.message}}
-async function loadStats(){try{const r=await fetch('/api/stats');const d=await r.json();const ms=d.models||{};const ks=Object.keys(ms);let h='<table class="alias-table" id="statsTable"><thead><tr><th>模型</th><th style="white-space:nowrap">请求数</th><th style="white-space:nowrap">输入 Token</th><th style="white-space:nowrap">输出 Token</th><th style="white-space:nowrap">总计 Token</th></tr></thead><tbody>';if(!ks.length){h+='<tr><td colspan="5" class="empty-hint">暂无数据</td></tr>'}else{let tr=0,pt=0,ct=0,tt=0;for(const k of ks){const m=ms[k];h+='<tr><td>'+esc(k)+'</td><td style="white-space:nowrap;text-align:right">'+fmt(m.request_count)+'</td><td style="white-space:nowrap;text-align:right">'+fmt(m.prompt_tokens)+'</td><td style="white-space:nowrap;text-align:right">'+fmt(m.completion_tokens)+'</td><td style="white-space:nowrap;text-align:right">'+fmt(m.total_tokens)+'</td></tr>';tr+=m.request_count;pt+=m.prompt_tokens;ct+=m.completion_tokens;tt+=m.total_tokens}h+='<tr style="font-weight:600;background:#f8f8f8"><td style="white-space:nowrap">总计</td><td style="white-space:nowrap;text-align:right">'+fmt(tr)+'</td><td style="white-space:nowrap;text-align:right">'+fmt(pt)+'</td><td style="white-space:nowrap;text-align:right">'+fmt(ct)+'</td><td style="white-space:nowrap;text-align:right">'+fmt(tt)+'</td></tr>'}h+='</tbody></table>';document.getElementById('statsContent').innerHTML=h}catch(e){document.getElementById('statsContent').innerHTML='<div class="empty-hint">加载失败</div>'}}
-function fmt(n){return n.toString().replace(/\B(?=(\d{3})+(?!\d))/g,',')}window.onload=function(){loadConfig();loadStats()};setInterval(loadStats,5000);document.addEventListener('visibilitychange',function(){if(!document.hidden)loadStats()});
+async function resetStats(){if(!confirm('确认清空所有 Token 统计？\n此操作不可撤销。'))return;const s=document.getElementById('resetStatus');s.textContent='清空中...';try{const r=await fetch('/admin/api/stats',{method:'DELETE'});if(!r.ok)throw new Error(await r.text());document.getElementById('statsContent').innerHTML='<div class="empty-hint">暂无数据</div>';s.textContent='已清空';setTimeout(()=>s.textContent='',2000)}catch(e){s.textContent='失败: '+e.message}}
+async function loadStats(){try{const r=await fetch('/admin/api/stats');const d=await r.json();const ms=d.models||{};const ks=Object.keys(ms);let h='<table class="alias-table"><thead><tr><th>模型</th><th>请求数</th><th>输入 Token</th><th>输出 Token</th><th>总计 Token</th></tr></thead><tbody>';if(!ks.length){h+='<tr><td colspan="5" class="empty-hint">暂无数据</td></tr>'}else{let tr=0,pt=0,ct=0,tt=0;for(const k of ks){const m=ms[k];h+='<tr><td>'+esc(k)+'</td><td>'+m.request_count+'</td><td>'+m.prompt_tokens+'</td><td>'+m.completion_tokens+'</td><td>'+m.total_tokens+'</td></tr>';tr+=m.request_count;pt+=m.prompt_tokens;ct+=m.completion_tokens;tt+=m.total_tokens}h+='<tr style="font-weight:600;background:#f8f8f8"><td>总计</td><td>'+tr+'</td><td>'+pt+'</td><td>'+ct+'</td><td>'+tt+'</td></tr>'}h+='</tbody></table>';document.getElementById('statsContent').innerHTML=h}catch(e){document.getElementById('statsContent').innerHTML='<div class="empty-hint">加载失败</div>'}}window.onload=function(){loadConfig();loadStats()};document.addEventListener('visibilitychange',function(){if(!document.hidden)loadStats()});
 </script>
 </body>
 </html>`
@@ -4152,6 +3374,9 @@ func main() {
 	flag.Parse()
 
 	cfg := loadConfig(configPath)
+	if cfg.ReasoningEffortMap == nil {
+		cfg.ReasoningEffortMap = map[string]string{"low": "high", "medium": "high", "xhigh": "max"}
+	}
 	applyConfig(cfg)
 	if err := saveConfig(configPath, cfg); err != nil {
 		log.Printf("警告: 无法保存配置: %v", err)
@@ -4179,18 +3404,18 @@ func main() {
 	log.Printf("上游:     https://opencode.ai/zen/v1/chat/completions (API)")
 	log.Printf("模型：  %d 个模型已加载", len(getModelIDs()))
 	log.Printf("别名：  %d", len(modelAlias))
-	log.Printf("管理:    http://localhost:%s/", port)
+	log.Printf("管理:    http://localhost:%s/admin", port)
 	log.Printf("===================")
 	http.HandleFunc("/v1/chat/completions", chatCompletionsHandler)
 	http.HandleFunc("/v1/responses", responsesHandler)
 	http.HandleFunc("/v1/messages", claudeMessagesHandler)
 	http.HandleFunc("/v1/models", listModelsHandler)
-	http.HandleFunc("/api/config", adminConfigHandler)
-	http.HandleFunc("/api/mm_models", adminMMModelsHandler)
-	http.HandleFunc("/api/stats", adminStatsHandler)
+	http.HandleFunc("/admin", adminPageHandler)
+	http.HandleFunc("/admin/api/config", adminConfigHandler)
+	http.HandleFunc("/admin/api/stats", adminStatsHandler)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
-			adminPageHandler(w, r)
+			http.Redirect(w, r, "/admin", http.StatusFound)
 			return
 		}
 		http.NotFound(w, r)
