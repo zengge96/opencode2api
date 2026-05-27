@@ -9,10 +9,5 @@
     "medium": "high",
     "xhigh": "max"
   },
-  "force_disable_thinking": false,
-  "multimodal_upstream": {
-    "base_url": "https://integrate.api.nvidia.com/v1",
-    "api_key": "nvapi-ZmQiKrQHeCaHTTS5OR0XqhA14or8NLJKMpQk67s3JjYXADRH8foYc",
-    "model": "qwen/qwen3.5-397b-a17b"
-  }
+  "force_disable_thinking": false
 }
